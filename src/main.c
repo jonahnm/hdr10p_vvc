@@ -7,6 +7,7 @@
 #include "vvc.h"
 #include "vvc_poc.h"
 #include "rpu.h"
+#include "mkv.h"
 
 #define PROGRAM "hdr10p_vvc"
 #define VERSION "1.0.0"
@@ -20,6 +21,7 @@ static void usage(FILE *f)
         "  %s inject -i <input.vvc> [-j <metadata.json>] [-r <rpu.bin>] -o <output.vvc>\n"
         "  %s extract -i <input.vvc> [-o <metadata.json>]\n"
         "  %s remove  -i <input.vvc> [-o <output.vvc>]\n"
+        "  %s mux     -i <input.vvc> [-j <metadata.json>] [-o <output.mkv>]\n"
         "\n"
         "Commands:\n"
         "  inject   Interleave HDR10+ prefix SEI NAL units before the first slice of\n"
@@ -30,17 +32,23 @@ static void usage(FILE *f)
         "  extract  Read HDR10+ metadata out of the stream and write a JSON file\n"
         "           compatible with hdr10plus_tool.\n"
         "  remove   Strip all HDR10+ SEI messages and Dolby Vision RPU NAL units.\n"
+        "  mux      Wrap the stream in Matroska with the HDR10+ metadata carried\n"
+        "           out-of-band in BlockAdditions (BlockAddID 4, ITU-T T.35). The\n"
+        "           stream is muxed in decode order; VVC-in-Matroska requires a\n"
+        "           player with VVC demux support (e.g. mkvmerge-compatible tools).\n"
         "\n"
         "Options:\n"
         "  -i FILE   input VVC bitstream (Annex B byte stream, e.g. -f vvc)\n"
-        "  -o FILE   output file (default: output.vvc / extracted.json)\n"
+        "  -o FILE   output file (default: output.vvc / extracted.json / output.mkv)\n"
         "  -j FILE   HDR10+ metadata JSON produced by hdr10plus_tool\n"
+        "            (mux without -j extracts the HDR10+ payloads already in the stream)\n"
         "  -r FILE   Dolby Vision RPU binary (dovi_tool extract output)\n"
         "  --rpu-nal-type N  VVC NAL unit type carrying the RPU (default 27)\n"
-        "  --no-reorder  (inject) associate metadata in decode order instead of\n"
+        "  --no-reorder  (inject/mux) associate metadata in decode order instead of\n"
         "           presentation order\n"
+        "  --fps N   (mux) frame rate used for timestamps (default 30)\n"
         "  -h        show this help\n",
-        PROGRAM, VERSION, PROGRAM, PROGRAM, PROGRAM);
+        PROGRAM, VERSION, PROGRAM, PROGRAM, PROGRAM, PROGRAM);
 }
 
 static int read_file(const char *path, uint8_t **data, size_t *len)
@@ -531,6 +539,528 @@ fail_meta:
     return 1;
 }
 
+/* ---------- mux ---------- */
+
+/*
+ * If the NAL unit is a prefix SEI carrying an ST 2094-40 message, return the
+ * raw T.35 payload as a malloc'd copy: returns 1 and sets *payload and
+ * *payload_len, 0 when there is no HDR10+ message, -1 on allocation failure.
+ */
+static int sei_payload_from_nal(const vvc_nal *nal, uint8_t **payload,
+                                size_t *payload_len)
+{
+    if (nal->nal_unit_type != VVC_PREFIX_SEI_NUT)
+        return 0;
+    uint8_t *rbsp = malloc(nal->len);
+    if (!rbsp)
+        return -1;
+    int rc = 0;
+    size_t rlen = vvc_rbsp_from_nal(nal->data, nal->len, rbsp);
+    if (rlen >= 2) {
+        vvc_sei_msg msgs[32];
+        int n = vvc_parse_sei(rbsp + 2, rlen - 2, msgs, 32);
+        for (int m = 0; m < n; m++) {
+            if (msgs[m].payload_type != VVC_SEI_USER_DATA_REGISTERED_ITU_T_T35)
+                continue;
+            const uint8_t *pb = rbsp + 2 + msgs[m].payload_offset;
+            if (!st2094_detect(pb, msgs[m].payload_size))
+                continue;
+            uint8_t *copy = malloc(msgs[m].payload_size);
+            if (!copy) {
+                rc = -1;
+                break;
+            }
+            memcpy(copy, pb, msgs[m].payload_size);
+            *payload = copy;
+            *payload_len = msgs[m].payload_size;
+            rc = 1;
+            break;
+        }
+    }
+    free(rbsp);
+    return rc;
+}
+
+/*
+ * Collect the HDR10+ payloads already present in the stream, one per access
+ * unit. The prefix SEI NAL units of an access unit sit before its first VCL
+ * NAL unit (au_start[k]); the suffix region of the previous access unit
+ * ([au_start[k-1] .. au_start[k]) after its last VCL NAL unit) is scanned
+ * first, then the access unit's own range as a fallback. Access units without
+ * metadata repeat the previous payload. Returns 0 with *out and *out_lens set
+ * (caller frees each entry) or -1 when the stream has no HDR10+ payloads.
+ */
+static int collect_au_hdr10p(const vvc_nal_list *nals, const int *au_start,
+                             int au_count, uint8_t ***out, size_t **out_lens)
+{
+    uint8_t **pl = calloc((size_t)au_count, sizeof(*pl));
+    size_t *pll = calloc((size_t)au_count, sizeof(*pll));
+    if (!pl || !pll) {
+        free(pl);
+        free(pll);
+        return -1;
+    }
+
+    for (int k = 0; k < au_count; k++) {
+        /* Trailing non-VCL NAL units of the previous AU range (prefix SEIs). */
+        for (int j = au_start[k] - 1; j >= 0 && !nals->nals[j].is_vcl; j--) {
+            int rc = sei_payload_from_nal(&nals->nals[j], &pl[k], &pll[k]);
+            if (rc < 0)
+                goto oom;
+            if (rc == 1)
+                break;
+        }
+        /* Fallback: the access unit's own range (suffix SEIs etc.). */
+        if (!pl[k]) {
+            int range_end = (k + 1 < au_count) ? au_start[k + 1] : nals->n;
+            for (int j = au_start[k]; j < range_end; j++) {
+                int rc = sei_payload_from_nal(&nals->nals[j], &pl[k], &pll[k]);
+                if (rc < 0)
+                    goto oom;
+                if (rc == 1)
+                    break;
+            }
+        }
+        if (!pl[k] && k > 0 && pll[k - 1] > 0) {
+            pl[k] = malloc(pll[k - 1]);
+            if (!pl[k])
+                goto oom;
+            memcpy(pl[k], pl[k - 1], pll[k - 1]);
+            pll[k] = pll[k - 1];
+        }
+    }
+    int found = 0;
+    for (int k = 0; k < au_count; k++)
+        found += pl[k] != NULL;
+    if (!found)
+        goto oom;
+    *out = pl;
+    *out_lens = pll;
+    return 0;
+
+oom:
+    for (int k = 0; k < au_count; k++)
+        free(pl[k]);
+    free(pl);
+    free(pll);
+    return -1;
+}
+
+/*
+ * Serialize one access unit as a Matroska block payload (Annex B NAL units
+ * with 4-byte start codes). HDR10+ prefix SEI messages are stripped so the
+ * metadata lives only in the BlockAdditions. Returns 0 on success.
+ */
+static int build_au_payload(const vvc_nal_list *nals, int start, int end, mkv_buf *out)
+{
+    for (int j = start; j < end; j++) {
+        const vvc_nal *nal = &nals->nals[j];
+        if (nal->nal_unit_type == VVC_PREFIX_SEI_NUT) {
+            uint8_t *rewritten = NULL;
+            size_t rlen = 0;
+            int drop = 0;
+            int rc = strip_hdr10p_from_sei(nal->data, nal->len, &rewritten, &rlen, &drop);
+            if (rc < 0)
+                return -1;
+            if (rc == 1) {
+                if (!drop) {
+                    if (mkv_append(out, "\x00\x00\x00\x01", 4) < 0 ||
+                        mkv_append(out, rewritten, rlen) < 0) {
+                        free(rewritten);
+                        return -1;
+                    }
+                }
+                free(rewritten);
+                continue;
+            }
+            /* rc == 0: no HDR10+ message, keep the NAL as is. */
+        }
+        if (mkv_append(out, "\x00\x00\x00\x01", 4) < 0 ||
+            mkv_append(out, nal->data, nal->len) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int cmd_mux(int argc, char **argv)
+{
+    const char *in_path = NULL, *json_path = NULL, *out_path = "output.mkv";
+    int reorder = 1, fps = 30;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "-i") && i + 1 < argc) in_path = argv[++i];
+        else if (!strcmp(argv[i], "-j") && i + 1 < argc) json_path = argv[++i];
+        else if (!strcmp(argv[i], "-o") && i + 1 < argc) out_path = argv[++i];
+        else if (!strcmp(argv[i], "--no-reorder")) reorder = 0;
+        else if (!strcmp(argv[i], "--fps") && i + 1 < argc) {
+            char *endp = NULL;
+            long v = strtol(argv[++i], &endp, 10);
+            if (!endp || *endp != '\0' || v <= 0 || v > 1000) {
+                fprintf(stderr, "error: --fps must be a frame rate in 1..1000\n");
+                return 1;
+            }
+            fps = (int)v;
+        } else {
+            fprintf(stderr, "error: unknown argument '%s'\n", argv[i]);
+            return 1;
+        }
+    }
+    if (!in_path) {
+        fprintf(stderr, "error: mux requires -i\n");
+        return 1;
+    }
+
+    uint8_t *buf = NULL;
+    size_t buflen = 0;
+    if (read_file(in_path, &buf, &buflen) < 0)
+        return 1;
+
+    vvc_nal_list nals = { 0 };
+    if (vvc_scan_stream(buf, buflen, &nals) < 0) {
+        fprintf(stderr, "error: %s is not a VVC Annex B byte stream\n", in_path);
+        free(buf);
+        return 1;
+    }
+
+    int *au_start = malloc(sizeof(int) * (size_t)(nals.n + 1));
+    int au_count = 0;
+    vvc_compute_aus(&nals, au_start, &au_count);
+    if (au_count == 0) {
+        fprintf(stderr, "error: no access units (no VCL NAL units) found\n");
+        free(au_start);
+        vvc_nal_list_free(&nals);
+        free(buf);
+        return 1;
+    }
+
+    int *presentation = malloc(sizeof(int) * (size_t)au_count);
+    if (!presentation) {
+        fprintf(stderr, "error: out of memory\n");
+        free(au_start);
+        vvc_nal_list_free(&nals);
+        free(buf);
+        return 1;
+    }
+    if (reorder) {
+        if (vvc_compute_presentation_order(&nals, au_start, au_count, presentation) == 0) {
+            int changed = 0;
+            for (int i = 0; i < au_count; i++)
+                if (presentation[i] != i)
+                    changed = 1;
+            if (changed)
+                printf("Reordered metadata to presentation order (%d access unit(s) differ)\n",
+                       au_count);
+            else
+                reorder = 0;
+        } else {
+            fprintf(stderr,
+                    "Warning: could not determine picture order count; "
+                    "metadata will be associated in decode order\n");
+            reorder = 0;
+        }
+    }
+    if (!reorder) {
+        for (int i = 0; i < au_count; i++)
+            presentation[i] = i;
+    }
+
+    /* Per-access-unit HDR10+ T.35 payloads (BlockAddID 4 format). */
+    uint8_t **au_payload = calloc((size_t)au_count, sizeof(*au_payload));
+    size_t *au_payload_len = calloc((size_t)au_count, sizeof(*au_payload_len));
+    int *au_payload_owned = calloc((size_t)au_count, sizeof(*au_payload_owned));
+    uint8_t **payloads = NULL;
+    size_t *payload_lens = NULL;
+    jval *root = NULL;
+    st2094_meta *metas = NULL;
+    int n_meta = 0;
+    if (!au_payload || !au_payload_len || !au_payload_owned) {
+        fprintf(stderr, "error: out of memory\n");
+        goto fail;
+    }
+
+    if (json_path) {
+        root = json_parse_file(json_path);
+        if (!root) {
+            fprintf(stderr, "error: failed to parse JSON metadata %s\n", json_path);
+            goto fail;
+        }
+        const jval *scene_info = json_obj_get(root, "SceneInfo");
+        if (!scene_info || scene_info->type != J_ARR || json_arr_len(scene_info) == 0) {
+            fprintf(stderr, "error: JSON has no SceneInfo array\n");
+            goto fail;
+        }
+        n_meta = json_arr_len(scene_info);
+        metas = calloc((size_t)n_meta, sizeof(st2094_meta));
+        payloads = calloc((size_t)n_meta, sizeof(uint8_t *));
+        payload_lens = calloc((size_t)n_meta, sizeof(size_t));
+        if (!metas || !payloads || !payload_lens) {
+            fprintf(stderr, "error: out of memory\n");
+            goto fail;
+        }
+        for (int i = 0; i < n_meta; i++) {
+            if (st2094_from_json(scene_info->elems[i], &metas[i]) < 0 ||
+                st2094_encode(&metas[i], 1, &payloads[i], &payload_lens[i]) < 0) {
+                fprintf(stderr, "error: invalid metadata at SceneInfo index %d\n", i);
+                goto fail;
+            }
+        }
+        for (int k = 0; k < au_count; k++) {
+            int idx = presentation[k] < n_meta ? presentation[k] : n_meta - 1;
+            au_payload[k] = payloads[idx];
+            au_payload_len[k] = payload_lens[idx];
+        }
+        printf("Parsed %d access unit(s), %d metadata entr%s\n",
+               au_count, n_meta, n_meta == 1 ? "y" : "ies");
+        if (n_meta < au_count)
+            printf("Warning: fewer metadata entries than frames; last entry will be repeated\n");
+        else if (n_meta > au_count)
+            printf("Warning: more metadata entries than frames; extras will be skipped\n");
+    } else {
+        uint8_t **extracted = NULL;
+        size_t *extracted_lens = NULL;
+        if (collect_au_hdr10p(&nals, au_start, au_count, &extracted, &extracted_lens) < 0) {
+            fprintf(stderr,
+                    "error: no HDR10+ metadata found in %s (use -j to supply metadata)\n",
+                    in_path);
+            goto fail;
+        }
+        for (int k = 0; k < au_count; k++) {
+            au_payload[k] = extracted[k];
+            au_payload_len[k] = extracted_lens[k];
+            au_payload_owned[k] = 1;
+        }
+        free(extracted);
+        free(extracted_lens);
+        printf("Extracted %d HDR10+ metadata entr%s from stream\n",
+               au_count, au_count == 1 ? "y" : "ies");
+    }
+
+    /* Picture size from the first SPS, if parseable. */
+    int width = 0, height = 0;
+    int have_size = 0;
+    for (int i = 0; i < nals.n; i++) {
+        if (nals.nals[i].nal_unit_type == VVC_SPS_NUT) {
+            uint8_t *rbsp = malloc(nals.nals[i].len);
+            if (!rbsp)
+                goto fail;
+            size_t rlen = vvc_rbsp_from_nal(nals.nals[i].data, nals.nals[i].len, rbsp);
+            vvc_sps sps;
+            if (rlen >= 2 && vvc_parse_sps(rbsp + 2, rlen - 2, &sps) == 0 &&
+                sps.width > 0 && sps.height > 0) {
+                width = sps.width;
+                height = sps.height;
+                have_size = 1;
+            } else {
+                fprintf(stderr, "Warning: could not parse SPS picture size; "
+                                "the Video element will be omitted\n");
+            }
+            free(rbsp);
+            break;
+        }
+    }
+
+    mkv_buf mkv;
+    mkv_init(&mkv);
+    int rc = 0;
+    do {
+        /* EBML header */
+        size_t p_ebml = mkv_master_begin(&mkv, 0x1A45DFA3);
+        if (mkv_uint(&mkv, 0x4286, 1) < 0 || mkv_uint(&mkv, 0x42F7, 1) < 0 ||
+            mkv_uint(&mkv, 0x42F2, 4) < 0 || mkv_uint(&mkv, 0x42F3, 8) < 0 ||
+            mkv_str(&mkv, 0x4282, "matroska") < 0 ||
+            mkv_uint(&mkv, 0x4287, 4) < 0 || mkv_uint(&mkv, 0x4285, 2) < 0) {
+            rc = -1;
+            break;
+        }
+        if (mkv_master_end(&mkv, p_ebml) < 0) {
+            rc = -1;
+            break;
+        }
+
+        /* Segment */
+        size_t p_seg = mkv_master_begin(&mkv, 0x18538067);
+        size_t p_info = mkv_master_begin(&mkv, 0x1549A966);
+        if (mkv_uint(&mkv, 0x2AD7B1, 1000000) < 0 ||
+            mkv_str(&mkv, 0x4D80, "hdr10p_vvc") < 0 ||
+            mkv_str(&mkv, 0x5741, PROGRAM " " VERSION) < 0) {
+            rc = -1;
+            break;
+        }
+        if (mkv_master_end(&mkv, p_info) < 0) {
+            rc = -1;
+            break;
+        }
+
+        /* Tracks */
+        size_t p_tracks = mkv_master_begin(&mkv, 0x1654AE6B);
+        size_t p_track = mkv_master_begin(&mkv, 0xAE);
+        if (mkv_uint(&mkv, 0xD7, 1) < 0 || mkv_uint(&mkv, 0x73C5, 1) < 0 ||
+            mkv_uint(&mkv, 0x83, 1) < 0 || mkv_uint(&mkv, 0x9C, 0) < 0 ||
+            mkv_str(&mkv, 0x86, "V_MPEGH/ISO/VVC") < 0 ||
+            mkv_uint(&mkv, 0x55EE, 4) < 0) {
+            rc = -1;
+            break;
+        }
+        size_t p_map = mkv_master_begin(&mkv, 0x41E4);
+        if (mkv_str(&mkv, 0x41A4, "HDR10+ Metadata") < 0 ||
+            mkv_uint(&mkv, 0x41E7, 4) < 0 || mkv_uint(&mkv, 0x41F0, 4) < 0) {
+            rc = -1;
+            break;
+        }
+        if (mkv_master_end(&mkv, p_map) < 0) {
+            rc = -1;
+            break;
+        }
+        if (have_size) {
+            size_t p_video = mkv_master_begin(&mkv, 0xE0);
+            if (mkv_uint(&mkv, 0xB0, (uint64_t)width) < 0 ||
+                mkv_uint(&mkv, 0xBA, (uint64_t)height) < 0) {
+                rc = -1;
+                break;
+            }
+            if (mkv_master_end(&mkv, p_video) < 0) {
+                rc = -1;
+                break;
+            }
+        }
+        if (mkv_master_end(&mkv, p_track) < 0 || mkv_master_end(&mkv, p_tracks) < 0) {
+            rc = -1;
+            break;
+        }
+
+        /* Clusters: one per access unit, decode order. The block spans the
+         * access unit's leading non-VCL NAL units (AUD, parameter sets, prefix
+         * SEI) up to the next access unit's first VCL NAL unit. */
+        for (int k = 0; k < au_count; k++) {
+            int blk_start = au_start[k];
+            for (int j = au_start[k] - 1; j >= 0 && !nals.nals[j].is_vcl; j--)
+                blk_start = j;
+            int range_end = (k + 1 < au_count) ? au_start[k + 1] : nals.n;
+            while (range_end > au_start[k] && !nals.nals[range_end - 1].is_vcl)
+                range_end--;
+            uint64_t ts = (uint64_t)((2 * (int64_t)k * 1000 + fps) / (2 * fps));
+
+            mkv_buf payload;
+            mkv_init(&payload);
+            if (build_au_payload(&nals, blk_start, range_end, &payload) < 0) {
+                mkv_free(&payload);
+                rc = -1;
+                break;
+            }
+
+            int keyframe = 0;
+            for (int j = au_start[k]; j < range_end; j++) {
+                if (nals.nals[j].is_vcl) {
+                    keyframe = nals.nals[j].is_irap;
+                    break;
+                }
+            }
+
+            size_t p_cluster = mkv_master_begin(&mkv, 0x1F43B675);
+            if (mkv_uint(&mkv, 0xE7, ts) < 0) {
+                mkv_free(&payload);
+                rc = -1;
+                break;
+            }
+            size_t p_group = mkv_master_begin(&mkv, 0xA0);
+            /* SimpleBlock: track 1, relative timestamp 0, flags */
+            uint8_t flags = (uint8_t)(keyframe ? 0x80 : 0x00);
+            mkv_buf sb;
+            mkv_init(&sb);
+            if (mkv_vint(&sb, 1) < 0 || mkv_append(&sb, "\x00\x00", 2) < 0 ||
+                mkv_u8(&sb, flags) < 0 ||
+                mkv_append(&sb, payload.data, payload.len) < 0) {
+                mkv_free(&sb);
+                mkv_free(&payload);
+                rc = -1;
+                break;
+            }
+            if (mkv_bin(&mkv, 0xA1, sb.data, sb.len) < 0) {
+                mkv_free(&sb);
+                mkv_free(&payload);
+                rc = -1;
+                break;
+            }
+            mkv_free(&sb);
+            size_t p_more = mkv_master_begin(&mkv, 0xA6);
+            if (mkv_uint(&mkv, 0xEE, 4) < 0 ||
+                mkv_bin(&mkv, 0xA5, au_payload[k], au_payload_len[k]) < 0) {
+                mkv_free(&payload);
+                rc = -1;
+                break;
+            }
+            if (mkv_master_end(&mkv, p_more) < 0) {
+                mkv_free(&payload);
+                rc = -1;
+                break;
+            }
+            size_t p_adds = mkv_master_begin(&mkv, 0x75A1);
+            if (mkv_master_end(&mkv, p_adds) < 0 ||
+                mkv_master_end(&mkv, p_group) < 0 ||
+                mkv_master_end(&mkv, p_cluster) < 0) {
+                mkv_free(&payload);
+                rc = -1;
+                break;
+            }
+            mkv_free(&payload);
+        }
+        if (rc < 0)
+            break;
+        if (mkv_master_end(&mkv, p_seg) < 0) {
+            rc = -1;
+            break;
+        }
+        if (mkv_write_file(&mkv, out_path) < 0) {
+            fprintf(stderr, "error: failed to write %s\n", out_path);
+            rc = -1;
+            break;
+        }
+        printf("Wrote %s: %d access unit(s), %d HDR10+ payload(s) in BlockAdditions (BlockAddID 4)\n",
+               out_path, au_count, au_count);
+    } while (0);
+    mkv_free(&mkv);
+
+    for (int k = 0; k < au_count; k++)
+        if (au_payload_owned[k])
+            free(au_payload[k]);
+    free(au_payload);
+    free(au_payload_len);
+    free(au_payload_owned);
+    for (int i = 0; i < n_meta; i++) {
+        free(payloads ? payloads[i] : NULL);
+        st2094_free(&metas[i]);
+    }
+    free(payloads);
+    free(payload_lens);
+    free(metas);
+    json_free(root);
+    free(presentation);
+    free(au_start);
+    vvc_nal_list_free(&nals);
+    free(buf);
+    return rc < 0 ? 1 : 0;
+
+fail:
+    for (int k = 0; k < au_count; k++)
+        if (au_payload_owned)
+            free(au_payload[k]);
+    free(au_payload);
+    free(au_payload_len);
+    free(au_payload_owned);
+    for (int i = 0; i < n_meta; i++) {
+        free(payloads ? payloads[i] : NULL);
+        st2094_free(&metas[i]);
+    }
+    free(payloads);
+    free(payload_lens);
+    free(metas);
+    json_free(root);
+    free(presentation);
+    free(au_start);
+    vvc_nal_list_free(&nals);
+    free(buf);
+    return 1;
+}
+
 /* ---------- remove ---------- */
 
 static int cmd_remove(int argc, char **argv)
@@ -858,6 +1388,8 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[1], "inject"))
         return cmd_inject(argc, argv);
+    if (!strcmp(argv[1], "mux"))
+        return cmd_mux(argc, argv);
     if (!strcmp(argv[1], "remove"))
         return cmd_remove(argc, argv);
     if (!strcmp(argv[1], "extract"))

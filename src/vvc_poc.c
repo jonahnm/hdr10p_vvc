@@ -211,6 +211,8 @@ int vvc_parse_sps(const uint8_t *rbsp, size_t len, vvc_sps *out)
     uint32_t pic_width_max = 0, pic_height_max = 0;
     if (br_read_ue(&r, &pic_width_max) < 0) return -1;
     if (br_read_ue(&r, &pic_height_max) < 0) return -1;
+    out->width = (int)pic_width_max;
+    out->height = (int)pic_height_max;
 
     if (br_bit(&r, &b) < 0) return -1; /* sps_conformance_window_flag */
     if (b) {

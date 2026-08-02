@@ -22,6 +22,8 @@ typedef struct {
     uint8_t poc_msb_cycle_flag;
     uint8_t poc_msb_cycle_len_minus1;
     uint8_t num_extra_ph_bytes;
+    int     width;   /* sps_pic_width_max_in_luma_samples */
+    int     height;  /* sps_pic_height_max_in_luma_samples */
     int     valid;
 } vvc_sps;
 
