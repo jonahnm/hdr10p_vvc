@@ -34,8 +34,8 @@ static void usage(FILE *f)
         "  remove   Strip all HDR10+ SEI messages and Dolby Vision RPU NAL units.\n"
         "  mux      Wrap the stream in Matroska with the HDR10+ metadata carried\n"
         "           out-of-band in BlockAdditions (BlockAddID 4, ITU-T T.35). The\n"
-        "           stream is muxed in decode order; VVC-in-Matroska requires a\n"
-        "           player with VVC demux support (e.g. mkvmerge-compatible tools).\n"
+        "           stream is muxed in decode order; the track is tagged\n"
+        "           V_MPEGI/ISO/VVC (ffmpeg >= 8.0 and mkvmerge can demux it).\n"
         "\n"
         "Options:\n"
         "  -i FILE   input VVC bitstream (Annex B byte stream, e.g. -f vvc)\n"
@@ -895,7 +895,7 @@ static int cmd_mux(int argc, char **argv)
         size_t p_track = mkv_master_begin(&mkv, 0xAE);
         if (mkv_uint(&mkv, 0xD7, 1) < 0 || mkv_uint(&mkv, 0x73C5, 1) < 0 ||
             mkv_uint(&mkv, 0x83, 1) < 0 || mkv_uint(&mkv, 0x9C, 0) < 0 ||
-            mkv_str(&mkv, 0x86, "V_MPEGH/ISO/VVC") < 0 ||
+            mkv_str(&mkv, 0x86, "V_MPEGI/ISO/VVC") < 0 ||
             mkv_uint(&mkv, 0x55EE, 4) < 0) {
             rc = -1;
             break;

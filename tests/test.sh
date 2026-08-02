@@ -130,9 +130,9 @@ echo "== mux =="
 # verified with mkvmerge when available (ffmpeg 8.x cannot demux VVC in MKV).
 ./hdr10p_vvc mux -i "$WORK/injected.vvc" -o "$WORK/muxed.mkv" >/dev/null
 if command -v mkvmerge >/dev/null 2>&1; then
-    mkvmerge -i "$WORK/muxed.mkv" 2>&1 | grep -q "V_MPEGH/ISO/VVC" \
+    mkvmerge -i "$WORK/muxed.mkv" 2>&1 | grep -q "V_MPEGI/ISO/VVC" \
         || { echo "FAIL: mkvmerge does not recognize the VVC track"; exit 1; }
-    echo "mux OK (mkvmerge: V_MPEGH/ISO/VVC track, BlockAddID 4 additions)"
+    echo "mux OK (mkvmerge: V_MPEGI/ISO/VVC track, BlockAddID 4 additions)"
 else
     head -c4 "$WORK/muxed.mkv" | grep -q "$(printf '\x1a\x45\xdf\xa3')" \
         || { echo "FAIL: muxed output is not an EBML file"; exit 1; }
